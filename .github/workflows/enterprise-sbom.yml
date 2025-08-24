@@ -1,0 +1,115 @@
+name: Generate SBOM
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  generate-sbom:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Generate SBOM (multi-ecosystem with fallbacks)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          REPO="${{ github.event.repository.name }}"
+          SBOM_REPO="${REPO}.cyclonedx.json"
+          SBOM_STD="sbom.json"
+          GENERATED=""
+
+          echo " Repo: $REPO"
+          echo "Target SBOM file: $SBOM_REPO"
+
+
+          if [[ -f "pom.xml" ]]; then
+            echo " Maven project detected, generating CycloneDX SBOM…"
+            sudo apt-get update -y
+            sudo apt-get install -y maven
+            mvn -q -DskipTests package || true
+            mvn -q -DskipTests org.cyclonedx:cyclonedx-maven-plugin:2.7.9:makeAggregateBom               -DoutputFormat=json -DoutputName=sbom || true
+            if [[ -f "target/sbom.json" ]]; then
+              mv target/sbom.json "$SBOM_REPO"
+              GENERATED="maven"
+            elif [[ -f "target/bom.json" ]]; then
+              mv target/bom.json "$SBOM_REPO"
+              GENERATED="maven"
+            fi
+          fi
+
+
+          if [[ -z "${GENERATED}" && ( -f "package.json" || -f "package-lock.json" || -f "yarn.lock" ) ]]; then
+            echo " Node.js project detected, generating CycloneDX SBOM…"
+            if ! npx -y @cyclonedx/bom@latest -o "$SBOM_REPO" -t JSON >/dev/null 2>&1; then
+              echo " npx @cyclonedx/bom failed, trying global install…"
+              npm install -g @cyclonedx/bom || true
+              export PATH="$(npm bin -g):$PATH"
+              if ! cyclonedx-bom -o "$SBOM_REPO" -t JSON >/dev/null 2>&1; then
+                echo " cyclonedx-bom failed, trying cdxgen…"
+                if ! npx -y @cyclonedx/cdxgen@latest -o "$SBOM_REPO" -t npm >/dev/null 2>&1; then
+                  echo " Node.js SBOM generation failed; falling back to Syft."
+                else
+                  GENERATED="node-cdxgen"
+                fi
+              else
+                GENERATED="node-cyclonedx-bom"
+              fi
+            else
+              GENERATED="node-cyclonedx-bom"
+            fi
+          fi
+
+
+          if [[ -z "${GENERATED}" ]]; then
+            echo " Unknown/other ecosystem; falling back to Syft…"
+            echo "scope: all" > .syft.yaml
+            echo "output:" >> .syft.yaml
+            echo "  - format: cyclonedx-json" >> .syft.yaml
+            curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+            syft dir:. -o cyclonedx-json > "$SBOM_REPO"
+            GENERATED="syft"
+          fi
+
+          if [[ ! -s "$SBOM_REPO" ]]; then
+            echo " SBOM file not generated or empty."
+            exit 1
+          fi
+
+
+          cp "$SBOM_REPO" "$SBOM_STD"
+
+          echo " SBOM generated using: ${GENERATED}"
+          echo " Generated files: $SBOM_REPO and $SBOM_STD"
+
+
+      - name: Upload repo-named SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.repository.name }}.cyclonedx.json
+          path: ${{ github.event.repository.name }}.cyclonedx.json
+
+      - name: Upload sbom.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.json
+
+      - name: Attach SBOM to release
+        if: ${{ github.event_name == 'release' }}
+        uses: softprops/action-gh-release@v1
+        with:
+          files: sbom.json
